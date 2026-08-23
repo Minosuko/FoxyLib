@@ -6,10 +6,11 @@ class SHA1 {
     public static function hash(string $data): string {
         $h = [0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476, 0xc3d2e1f0];
         $len = strlen($data);
-        $bits = $len * 8;
+        $bitsHigh = intdiv($len, 0x20000000);
+        $bitsLow = ($len % 0x20000000) * 8;
         $data .= "\x80";
         while ((strlen($data) % 64) !== 56) $data .= "\x00";
-        $data .= pack('N2', 0, $bits);
+        $data .= pack('N2', $bitsHigh, $bitsLow);
         for ($i = 0; $i < strlen($data); $i += 64) {
             $w = [];
             for ($j = 0; $j < 16; $j++) {
@@ -45,10 +46,11 @@ class SHA1 {
     public static function sha0(string $data): string {
         $h = [0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476, 0xc3d2e1f0];
         $len = strlen($data);
-        $bits = $len * 8;
+        $bitsHigh = intdiv($len, 0x20000000);
+        $bitsLow = ($len % 0x20000000) * 8;
         $data .= "\x80";
         while ((strlen($data) % 64) !== 56) $data .= "\x00";
-        $data .= pack('N2', 0, $bits);
+        $data .= pack('N2', $bitsHigh, $bitsLow);
         for ($i = 0; $i < strlen($data); $i += 64) {
             $w = [];
             for ($j = 0; $j < 16; $j++) {

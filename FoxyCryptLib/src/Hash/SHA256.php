@@ -62,10 +62,11 @@ class SHA256 {
     public static function hash(string $data, bool $is224 = false): string {
         $h = $is224 ? self::H224 : self::H256;
         $len = strlen($data);
-        $bits = $len * 8;
+        $bitsHigh = intdiv($len, 0x20000000);
+        $bitsLow = ($len % 0x20000000) * 8;
         $data .= "\x80";
         while ((strlen($data) % 64) !== 56) $data .= "\x00";
-        $data .= pack('N2', 0, $bits);
+        $data .= pack('N2', $bitsHigh, $bitsLow);
         for ($i = 0; $i < strlen($data); $i += 64) {
             self::process($h, substr($data, $i, 64));
         }

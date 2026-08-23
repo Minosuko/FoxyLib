@@ -12,6 +12,7 @@ class X509Certificate {
     private int $validTo;
     private object $subjectKey;
     private ?object $issuerKey;
+    private string $issuerKeyType = 'rsa';
     private ?string $signatureAlgo;
     private string $keyType = 'rsa';
     private string $der = '';
@@ -41,7 +42,7 @@ class X509Certificate {
     }
 
     public function setIssuerPrivateKey(RSA $rsa): self {
-        $this->issuerKey = $rsa; return $this;
+        $this->issuerKey = $rsa; $this->issuerKeyType = 'rsa'; return $this;
     }
 
     public function setSubjectPublicKeyEC(ECDSA $ec): self {
@@ -49,7 +50,21 @@ class X509Certificate {
     }
 
     public function setIssuerPrivateKeyEC(ECDSA $ec): self {
-        $this->issuerKey = $ec; return $this;
+        $this->issuerKey = $ec; $this->issuerKeyType = 'ec'; return $this;
+    }
+
+    public function setIssuerPrivateKeyFromRSAOrEC(RSA|ECDSA $key): self {
+        if ($key instanceof ECDSA) {
+            return $this->setIssuerPrivateKeyEC($key);
+        }
+        return $this->setIssuerPrivateKey($key);
+    }
+
+    public function setSubjectPublicKeyFromRSAOrEC(RSA|ECDSA $key): self {
+        if ($key instanceof ECDSA) {
+            return $this->setSubjectPublicKeyEC($key);
+        }
+        return $this->setSubjectPublicKey($key);
     }
 
     public function addExtension(Extension $ext): self {
@@ -61,10 +76,43 @@ class X509Certificate {
     }
 
     public function getExtensions(): array { return $this->extensions; }
+    public function getSubject(): array { return $this->subject; }
+    public function getSubjectKey(): RSA|ECDSA { return $this->subjectKey; }
+    public function getKeyType(): string { return $this->keyType; }
 
     public function computeSubjectKeyIdentifier(): string {
-        $spki = $this->encodeSubjectPublicKeyInfo();
-        return hex2bin(Hash::hash('sha1', $spki));
+        return self::keyIdentifier($this->subjectKey);
+    }
+
+    public static function encodeSPKI(RSA|ECDSA $key): string {
+        if ($key instanceof ECDSA) {
+            $curve = $key->getCurve();
+            $pk = $key->getPublicKey();
+            $point = ECC::encodePoint($pk['x'], $pk['y'], $curve->keySize);
+            return DER::encodeSequence([
+                DER::encodeSequence([
+                    DER::encodeOID('1.2.840.10045.2.1'),
+                    DER::encodeOID($curve->oid)
+                ]),
+                DER::encodeBitString($point)
+            ]);
+        }
+        $pk = $key->getPublicKey();
+        $keyDer = DER::encodeSequence([
+            DER::encodeInteger($pk['n']->toBytes()),
+            DER::encodeInteger($pk['e']->toBytes())
+        ]);
+        return DER::encodeSequence([
+            DER::encodeSequence([
+                DER::encodeOID('1.2.840.113549.1.1.1'),
+                DER::encodeNull()
+            ]),
+            DER::encodeBitString($keyDer)
+        ]);
+    }
+
+    public static function keyIdentifier(RSA|ECDSA $key): string {
+        return hex2bin(Hash::hash('sha1', self::encodeSPKI($key)));
     }
 
     private function encodeName(array $name): string {
@@ -99,30 +147,7 @@ class X509Certificate {
     }
 
     private function encodeSubjectPublicKeyInfo(): string {
-        if ($this->keyType === 'ec') {
-            $curve = $this->subjectKey->getCurve();
-            $pk = $this->subjectKey->getPublicKey();
-            $point = ECC::encodePoint($pk['x'], $pk['y'], $curve->keySize);
-            return DER::encodeSequence([
-                DER::encodeSequence([
-                    DER::encodeOID('1.2.840.10045.2.1'),
-                    DER::encodeOID($curve->oid)
-                ]),
-                DER::encodeBitString($point)
-            ]);
-        }
-        $pk = $this->subjectKey->getPublicKey();
-        $keyDer = DER::encodeSequence([
-            DER::encodeInteger($pk['n']->toBytes()),
-            DER::encodeInteger($pk['e']->toBytes())
-        ]);
-        return DER::encodeSequence([
-            DER::encodeSequence([
-                DER::encodeOID('1.2.840.113549.1.1.1'),
-                DER::encodeNull()
-            ]),
-            DER::encodeBitString($keyDer)
-        ]);
+        return self::encodeSPKI($this->subjectKey);
     }
 
     private function encodeTBSCertificate(): string {
@@ -158,7 +183,7 @@ class X509Certificate {
     }
 
     private function getSignatureOID(): string {
-        if ($this->keyType === 'ec') {
+        if ($this->issuerKeyType === 'ec') {
             $map = [
                 'sha256' => '1.2.840.10045.4.3.2',
                 'sha384' => '1.2.840.10045.4.3.3',
@@ -182,7 +207,7 @@ class X509Certificate {
         $this->tbsDer = $this->encodeTBSCertificate();
         $digest = hex2bin(Hash::hash($this->signatureAlgo, $this->tbsDer));
 
-        if ($this->keyType === 'ec') {
+        if ($this->issuerKeyType === 'ec') {
             $this->savedSignature = $this->issuerKey->sign($this->tbsDer);
         } else {
             $this->savedSignature = $this->issuerKey->sign($digest, $this->signatureAlgo);
@@ -204,11 +229,16 @@ class X509Certificate {
 
     public function verify(): bool {
         if (!$this->der) return false;
-        $digest = hex2bin(Hash::hash($this->signatureAlgo, $this->tbsDer));
-        if ($this->keyType === 'ec') {
-            return $this->subjectKey->verify($this->tbsDer, $this->savedSignature);
+        return $this->verifyWithIssuer($this->subjectKey);
+    }
+
+    public function verifyWithIssuer(RSA|ECDSA $issuerKey): bool {
+        if (!$this->der || !$this->savedSignature) return false;
+        if ($issuerKey instanceof ECDSA) {
+            return $issuerKey->verify($this->tbsDer, $this->savedSignature);
         }
-        return $this->subjectKey->verify($digest, $this->savedSignature, $this->signatureAlgo);
+        $digest = hex2bin(Hash::hash($this->signatureAlgo, $this->tbsDer));
+        return $issuerKey->verify($digest, $this->savedSignature, $this->signatureAlgo);
     }
 
     public static function fromPEM(string $pem): array {
@@ -220,21 +250,32 @@ class X509Certificate {
 
     private static function parseDER(string $der): array {
         $parsed = DER::parse($der);
-        $tbsCert = $parsed['children'][0];
-        $tbsChildren = $tbsCert['children'];
+        $tbsChildren = $parsed['children'][0]['children'] ?? [];
+        $serialIndex = (($tbsChildren[0]['tag'] ?? null) === 0xa0) ? 1 : 0;
+        if (!isset(
+            $tbsChildren[$serialIndex],
+            $tbsChildren[$serialIndex + 2],
+            $tbsChildren[$serialIndex + 3],
+            $tbsChildren[$serialIndex + 4],
+            $tbsChildren[$serialIndex + 5],
+            $parsed['children'][1],
+            $parsed['children'][2]
+        )) {
+            throw new \RuntimeException('Malformed X.509 certificate');
+        }
         $sigValue = $parsed['children'][2];
         return [
-            'serialNumber' => BigInt::fromBytes($tbsChildren[1]['data']),
-            'issuer' => $tbsChildren[3],
-            'validity' => $tbsChildren[4],
-            'subject' => $tbsChildren[5],
-            'subjectPublicKeyInfo' => $tbsChildren[6],
+            'serialNumber' => BigInt::fromBytes($tbsChildren[$serialIndex]['data']),
+            'issuer' => $tbsChildren[$serialIndex + 2],
+            'validity' => $tbsChildren[$serialIndex + 3],
+            'subject' => $tbsChildren[$serialIndex + 4],
+            'subjectPublicKeyInfo' => $tbsChildren[$serialIndex + 5],
             'signatureAlgorithm' => $parsed['children'][1]['children'][0]['oid'] ?? '',
             'signatureValue' => $sigValue['data'],
         ];
     }
 
-    private function addDefaultExtensions(bool $isCA = false): void {
+    private function addDefaultExtensions(bool $isCA = false, ?int $pathLen = null): void {
         $hasKu = false;
         $hasBc = false;
         foreach ($this->extensions as $ext) {
@@ -242,7 +283,7 @@ class X509Certificate {
             if ($ext->oid === Extension::BASIC_CONSTRAINTS) $hasBc = true;
         }
         if (!$hasBc) {
-            $this->addExtension(Extension::makeBasicConstraints($isCA, $isCA ? 0 : null));
+            $this->addExtension(Extension::makeBasicConstraints($isCA, $pathLen ?? ($isCA ? 0 : null)));
         }
         if (!$hasKu) {
             $bits = $isCA
@@ -299,5 +340,66 @@ class X509Certificate {
              ->setValidity(time(), time() + $days * 86400);
         $cert->addDefaultExtensions(false);
         return $cert;
+    }
+
+    // --- Cross-signing (CA signed by another CA) ---
+
+    public static function createCrossSigned(RSA $subjectKey, RSA $caKey, array $subject, array $issuer, string $algo = 'sha256', int $days = 365, ?int $pathLen = null): self {
+        return self::createCrossSignedMixed($subjectKey, $caKey, $subject, $issuer, $algo, $days, $pathLen);
+    }
+
+    public static function createCrossSignedEC(ECDSA $subjectKey, ECDSA $caKey, array $subject, array $issuer, ?string $algo = null, int $days = 365, ?int $pathLen = null): self {
+        return self::createCrossSignedMixed($subjectKey, $caKey, $subject, $issuer, $algo ?? 'sha256', $days, $pathLen);
+    }
+
+    public static function createCrossSignedMixed(RSA|ECDSA $subjectKey, RSA|ECDSA $caKey, array $subject, array $issuer, string $algo = 'sha256', int $days = 365, ?int $pathLen = null): self {
+        $cert = new self();
+        $cert->setSubject($subject)->setIssuer($issuer)
+             ->setSubjectPublicKeyFromRSAOrEC($subjectKey)
+             ->setIssuerPrivateKeyFromRSAOrEC($caKey);
+
+        if ($caKey instanceof ECDSA) {
+            // ECDSA hashes with its curve hash; the declared algorithm must match the curve pair
+            $cert->setSignatureAlgorithm($caKey->getCurve()->hashAlgo);
+        } else {
+            $cert->setSignatureAlgorithm($algo);
+        }
+        $cert->setValidity(time(), time() + $days * 86400);
+        $cert->addDefaultExtensions(true, $pathLen);
+        $cert->ensureAuthorityKeyIdentifier($caKey);
+        return $cert;
+    }
+
+    public static function crossSignCertificate(self $target, RSA|ECDSA $caKey, array $issuer, ?string $algo = null, int $days = 365, ?int $pathLen = null, bool $carryExtensions = true): self {
+        $cross = new self();
+        $cross->setSubject($target->getSubject())->setIssuer($issuer)
+              ->setSubjectPublicKeyFromRSAOrEC($target->getSubjectKey())
+              ->setIssuerPrivateKeyFromRSAOrEC($caKey)
+              ->setValidity(time(), time() + $days * 86400);
+
+        if ($caKey instanceof ECDSA) {
+            $cross->setSignatureAlgorithm($caKey->getCurve()->hashAlgo);
+        } else {
+            $cross->setSignatureAlgorithm($algo ?? ($target->signatureAlgo ?? 'sha256'));
+        }
+
+        if ($carryExtensions) {
+            foreach ($target->getExtensions() as $ext) {
+                if ($ext->oid === Extension::AUTHORITY_KEY_IDENTIFIER || $ext->oid === Extension::BASIC_CONSTRAINTS) {
+                    continue;
+                }
+                $cross->addExtension($ext);
+            }
+        }
+        $cross->addDefaultExtensions(true, $pathLen);
+        $cross->ensureAuthorityKeyIdentifier($caKey);
+        return $cross;
+    }
+
+    private function ensureAuthorityKeyIdentifier(RSA|ECDSA $key): void {
+        foreach ($this->extensions as $ext) {
+            if ($ext->oid === Extension::AUTHORITY_KEY_IDENTIFIER) return;
+        }
+        $this->addExtension(Extension::makeAuthorityKeyIdentifier(self::keyIdentifier($key)));
     }
 }

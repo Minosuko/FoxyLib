@@ -29,6 +29,8 @@ class PKCS12 {
     const AES_256_CBC = '2.16.840.1.101.3.4.1.42';
     const HMAC_SHA1 = '1.2.840.113549.2.7';
     const HMAC_SHA256 = '1.2.840.113549.2.9';
+    const HMAC_SHA384 = '1.2.840.113549.2.10';
+    const HMAC_SHA512 = '1.2.840.113549.2.11';
 
     // Cert bag types
     const CERT_TYPE_X509 = '1.2.840.113549.1.9.22.1';
@@ -258,14 +260,20 @@ class PKCS12 {
 
         // Verify MAC if present
         if ($macData) {
-            $storedMac = $macData['children'][0]['children'][1]['data'];
+            $digestInfo = $macData['children'][0];
+            $macOid = $digestInfo['children'][0]['children'][0]['oid'] ?? '';
+            $macHash = self::hashOidToName($macOid);
+            $storedMac = $digestInfo['children'][1]['data'];
             $salt = $macData['children'][1]['data'];
             $iterations = isset($macData['children'][2])
                 ? (int)BigInt::fromBytes($macData['children'][2]['data'])->toInt()
                 : 1;
-            $macKey = hex2bin(Hash::pbkdf2('sha1', $password, $salt, $iterations, 20));
-            $computedMac = hex2bin(Hash::hmac('sha1', $safeContentsDer, $macKey));
-            if (!hash_equals($storedMac, $computedMac)) {
+            $macKey = self::pkcs12Kdf($macHash, $password, $salt, $iterations, 3, strlen($storedMac));
+            $computedMac = hex2bin(Hash::hmac($macHash, $safeContentsDer, $macKey));
+            // Keep compatibility with bundles produced by older FoxyCryptLib versions.
+            $legacyKey = hex2bin(Hash::pbkdf2('sha1', $password, $salt, $iterations, 20));
+            $legacyMac = hex2bin(Hash::hmac('sha1', $safeContentsDer, $legacyKey));
+            if (!hash_equals($storedMac, $computedMac) && !hash_equals($storedMac, $legacyMac)) {
                 throw new \RuntimeException('PKCS12 MAC verification failed (wrong password?)');
             }
         }
@@ -275,9 +283,45 @@ class PKCS12 {
         $certs = [];
         $keys = [];
 
-        self::parseSafeContents($safeContents, $certs, $keys, $password);
+        $firstContentOid = $dataContent['children'][0]['children'][0]['oid'] ?? '';
+        if (in_array($firstContentOid, [self::CT_DATA, self::CT_ENCRYPTED, self::CT_ENVELOPED], true)) {
+            foreach ($dataContent['children'] as $contentInfo) {
+                self::parseAuthenticatedSafeContent($contentInfo, $certs, $keys, $password);
+            }
+        } else {
+            self::parseSafeContents($dataContent, $certs, $keys, $password);
+        }
 
         return ['certificates' => $certs, 'privateKeys' => $keys, 'version' => $version];
+    }
+
+    private static function parseAuthenticatedSafeContent(
+        array $contentInfo,
+        array &$certs,
+        array &$keys,
+        string $password
+    ): void {
+        $contentType = $contentInfo['children'][0]['oid'] ?? '';
+        $wrapped = $contentInfo['children'][1]['children'][0] ?? null;
+        if ($wrapped === null) {
+            throw new \RuntimeException('Invalid PKCS12 AuthenticatedSafe content');
+        }
+        if ($contentType === self::CT_DATA) {
+            self::parseSafeContents(DER::parse($wrapped['data']), $certs, $keys, $password);
+            return;
+        }
+        if ($contentType === self::CT_ENCRYPTED) {
+            $encryptedContentInfo = $wrapped['children'][1] ?? null;
+            $algorithm = $encryptedContentInfo['children'][1] ?? null;
+            $ciphertext = $encryptedContentInfo['children'][2]['data'] ?? null;
+            if ($algorithm === null || !is_string($ciphertext)) {
+                throw new \RuntimeException('Invalid encrypted PKCS12 SafeContents');
+            }
+            $plaintext = self::decryptWithAlgorithm($algorithm, $ciphertext, $password);
+            self::parseSafeContents(DER::parse($plaintext), $certs, $keys, $password);
+            return;
+        }
+        throw new \RuntimeException("Unsupported PKCS12 content type: {$contentType}");
     }
 
     private static function parseSafeContents(array $container, array &$certs, array &$keys, string $password): void {
@@ -292,7 +336,8 @@ class PKCS12 {
             if ($bagId === self::BAG_CERT) {
                 $certType = $parsed['children'][0]['oid'] ?? '';
                 if ($certType === self::CERT_TYPE_X509 && isset($parsed['children'][1])) {
-                    $certs[] = $parsed['children'][1]['data'];
+                    $certs[] = $parsed['children'][1]['children'][0]['data']
+                        ?? $parsed['children'][1]['data'];
                 }
             } elseif ($bagId === self::BAG_PKCS8_SHROUDED) {
                 try {
@@ -311,46 +356,141 @@ class PKCS12 {
 
     private static function decryptShroudedKey(array $encKeyInfo, string $password): ?array {
         $encData = $encKeyInfo['children'][1]['data'] ?? '';
+        $algorithm = $encKeyInfo['children'][0] ?? null;
+        if ($algorithm === null) return null;
+        return self::parsePKCS8PrivateKey(self::decryptWithAlgorithm($algorithm, $encData, $password));
+    }
 
-        $pbes2Oid = $encKeyInfo['children'][0]['children'][0]['oid'] ?? '';
-
-        if ($pbes2Oid === self::PBES2) {
-            $pbes2Params = $encKeyInfo['children'][0]['children'][1]['children'] ?? [];
-            $kdfAlgo = $pbes2Params[0]['children'] ?? [];
-            $encAlgo = $pbes2Params[1]['children'] ?? [];
-
-            $pbkdf2Params = $kdfAlgo[1]['children'] ?? [];
-            $salt = $pbkdf2Params[0]['data'] ?? '';
-
-            $iter = isset($pbkdf2Params[1])
-                ? (int)BigInt::fromBytes($pbkdf2Params[1]['data'])->toInt()
-                : 2048;
-            $keyLen = isset($pbkdf2Params[2])
-                ? (int)BigInt::fromBytes($pbkdf2Params[2]['data'])->toInt()
-                : 32;
-
-            $iv = '';
-            if (isset($encAlgo[1]) && $encAlgo[1]['tag'] === DER::TAG_OCTET_STRING) {
-                $iv = $encAlgo[1]['data'];
-            }
-
-            $hashAlgo = 'sha1';
-            if (isset($pbkdf2Params[3]['children'][0]['oid'])) {
-                $hashAlgo = match ($pbkdf2Params[3]['children'][0]['oid']) {
-                    self::HMAC_SHA256 => 'sha256',
-                    self::HMAC_SHA1 => 'sha1',
-                    default => 'sha1'
-                };
-            }
-
-            $key = hex2bin(Hash::pbkdf2($hashAlgo, $password, $salt, $iter, $keyLen));
-            $aes = new AES($key);
-            $decrypted = $aes->decryptCBC($encData, $iv);
-
-            return self::parsePKCS8PrivateKey($decrypted);
+    private static function decryptWithAlgorithm(array $algorithm, string $ciphertext, string $password): string {
+        $oid = $algorithm['children'][0]['oid'] ?? '';
+        if ($oid !== self::PBES2) {
+            throw new \RuntimeException("Unsupported PKCS12 encryption algorithm: {$oid}");
         }
+        $params = $algorithm['children'][1]['children'] ?? [];
+        $kdf = $params[0]['children'] ?? [];
+        $encryption = $params[1]['children'] ?? [];
+        if (($kdf[0]['oid'] ?? '') !== self::PBKDF2) {
+            throw new \RuntimeException('PKCS12 PBES2 requires PBKDF2');
+        }
+        $pbkdf2 = $kdf[1]['children'] ?? [];
+        $salt = $pbkdf2[0]['data'] ?? '';
+        $iterations = isset($pbkdf2[1]['data'])
+            ? BigInt::fromBytes($pbkdf2[1]['data'])->toInt()
+            : 1;
+        if ($iterations < 1 || $iterations > 10000000) {
+            throw new \RuntimeException('Invalid PKCS12 PBKDF2 iteration count');
+        }
+        $encryptionOid = $encryption[0]['oid'] ?? '';
+        $keyLength = match ($encryptionOid) {
+            self::AES_128_CBC => 16,
+            self::AES_256_CBC => 32,
+            default => throw new \RuntimeException("Unsupported PKCS12 PBES2 cipher: {$encryptionOid}"),
+        };
+        $prfIndex = 2;
+        if (isset($pbkdf2[2]) && $pbkdf2[2]['tag'] === DER::TAG_INTEGER) {
+            $keyLength = BigInt::fromBytes($pbkdf2[2]['data'])->toInt();
+            $prfIndex = 3;
+        }
+        $prfOid = $pbkdf2[$prfIndex]['children'][0]['oid'] ?? self::HMAC_SHA1;
+        $hashAlgo = self::prfOidToName($prfOid);
+        $iv = $encryption[1]['data'] ?? '';
+        if (strlen($iv) !== 16) {
+            throw new \RuntimeException('Invalid PKCS12 AES initialization vector');
+        }
+        $key = hex2bin(Hash::pbkdf2($hashAlgo, $password, $salt, $iterations, $keyLength));
+        return (new AES($key))->decryptCBC($ciphertext, $iv);
+    }
 
-        return null;
+    private static function hashOidToName(string $oid): string {
+        return match ($oid) {
+            '1.3.14.3.2.26' => 'sha1',
+            '2.16.840.1.101.3.4.2.1' => 'sha256',
+            '2.16.840.1.101.3.4.2.2' => 'sha384',
+            '2.16.840.1.101.3.4.2.3' => 'sha512',
+            default => throw new \RuntimeException("Unsupported PKCS12 MAC hash: {$oid}"),
+        };
+    }
+
+    private static function prfOidToName(string $oid): string {
+        return match ($oid) {
+            self::HMAC_SHA1 => 'sha1',
+            self::HMAC_SHA256 => 'sha256',
+            self::HMAC_SHA384 => 'sha384',
+            self::HMAC_SHA512 => 'sha512',
+            default => throw new \RuntimeException("Unsupported PKCS12 PBKDF2 PRF: {$oid}"),
+        };
+    }
+
+    private static function pkcs12Kdf(
+        string $hashAlgo,
+        string $password,
+        string $salt,
+        int $iterations,
+        int $id,
+        int $length
+    ): string {
+        if ($iterations < 1 || $iterations > 10000000) {
+            throw new \RuntimeException('Invalid PKCS12 KDF iteration count');
+        }
+        $u = strlen(hex2bin(Hash::hash($hashAlgo, '')));
+        $v = in_array($hashAlgo, ['sha384', 'sha512'], true) ? 128 : 64;
+        $passwordBytes = self::passwordToBmpString($password);
+        $expand = static function (string $value, int $blockSize): string {
+            if ($value === '') return '';
+            $target = $blockSize * (int)ceil(strlen($value) / $blockSize);
+            return substr(str_repeat($value, (int)ceil($target / strlen($value))), 0, $target);
+        };
+        $diversifier = str_repeat(chr($id), $v);
+        $iBuffer = $expand($salt, $v) . $expand($passwordBytes, $v);
+        $result = '';
+        for ($block = 0; strlen($result) < $length; $block++) {
+            $a = hex2bin(Hash::hash($hashAlgo, $diversifier . $iBuffer));
+            for ($round = 1; $round < $iterations; $round++) {
+                $a = hex2bin(Hash::hash($hashAlgo, $a));
+            }
+            $result .= $a;
+            if ($iBuffer === '') continue;
+            $b = substr(str_repeat($a, (int)ceil($v / $u)), 0, $v);
+            for ($offset = 0; $offset < strlen($iBuffer); $offset += $v) {
+                $carry = 1;
+                for ($index = $v - 1; $index >= 0; $index--) {
+                    $sum = ord($iBuffer[$offset + $index]) + ord($b[$index]) + $carry;
+                    $iBuffer[$offset + $index] = chr($sum & 0xff);
+                    $carry = $sum >> 8;
+                }
+            }
+        }
+        return substr($result, 0, $length);
+    }
+
+    private static function passwordToBmpString(string $password): string {
+        $result = '';
+        for ($offset = 0; $offset < strlen($password);) {
+            $first = ord($password[$offset++]);
+            if ($first < 0x80) {
+                $codepoint = $first;
+            } elseif (($first & 0xe0) === 0xc0 && $offset < strlen($password)) {
+                $codepoint = (($first & 0x1f) << 6) | (ord($password[$offset++]) & 0x3f);
+            } elseif (($first & 0xf0) === 0xe0 && $offset + 1 < strlen($password)) {
+                $codepoint = (($first & 0x0f) << 12)
+                    | ((ord($password[$offset++]) & 0x3f) << 6)
+                    | (ord($password[$offset++]) & 0x3f);
+            } elseif (($first & 0xf8) === 0xf0 && $offset + 2 < strlen($password)) {
+                $codepoint = (($first & 0x07) << 18)
+                    | ((ord($password[$offset++]) & 0x3f) << 12)
+                    | ((ord($password[$offset++]) & 0x3f) << 6)
+                    | (ord($password[$offset++]) & 0x3f);
+            } else {
+                throw new \RuntimeException('PKCS12 password is not valid UTF-8');
+            }
+            if ($codepoint <= 0xffff) {
+                $result .= pack('n', $codepoint);
+            } else {
+                $codepoint -= 0x10000;
+                $result .= pack('nn', 0xd800 | ($codepoint >> 10), 0xdc00 | ($codepoint & 0x3ff));
+            }
+        }
+        return $result . "\x00\x00";
     }
 
     private static function parsePKCS8PrivateKey(string $pkcs8): ?array {

@@ -94,6 +94,37 @@ class CABundle {
         ));
     }
 
+    public function findCrossSignedVariants(array $cert): array {
+        // Same subject + same public key, but signed by a different issuer
+        $subjectDer = $cert['subject']['encoded'] ?? '';
+        $spkiRaw = $cert['subjectPublicKeyInfoRaw'] ?? '';
+        $issuerDer = $cert['issuer']['encoded'] ?? '';
+        $selfDer = $cert['der'] ?? '';
+        if (!$subjectDer || !$spkiRaw || !$selfDer) return [];
+
+        $variants = [];
+        foreach ($this->trustedCerts as $cand) {
+            if (($cand['subject']['encoded'] ?? '') !== $subjectDer) continue;
+            if (($cand['subjectPublicKeyInfoRaw'] ?? '') !== $spkiRaw) continue;
+            if (($cand['der'] ?? '') === $selfDer) continue;
+            $variants[] = $cand;
+        }
+        return array_values(array_filter($variants, fn($c) => ($c['issuer']['encoded'] ?? '') !== $issuerDer));
+    }
+
+    public function findByIssuerCAOf(array $cert): ?array {
+        // Prefer candidates that carry the authorityKeyIdentifier of the given cert
+        $issuerKeyId = $cert['authorityKeyIdentifier']['keyIdentifier'] ?? '';
+        if ($issuerKeyId) {
+            foreach ($this->findCandidatesFor($cert) as $cand) {
+                if (($cand['subjectKeyIdentifier'] ?? '') === $issuerKeyId) {
+                    return $cand;
+                }
+            }
+        }
+        return $this->findByIssuerOf($cert);
+    }
+
     public function findEndEntityCerts(): array {
         return array_values(array_filter($this->trustedCerts, fn($c) =>
             ($c['basicConstraints']['ca'] ?? true) === false
@@ -200,6 +231,7 @@ class CABundle {
                 'der' => $tbsChildren[5]['raw'] ?? $der,
             ],
             'subjectPublicKeyInfo' => $subjectPK,
+            'subjectPublicKeyInfoRaw' => $tbsChildren[6]['raw'] ?? '',
             'signatureAlgorithm' => $parsed['children'][1]['children'][0]['oid'] ?? '',
             'signatureValue' => $parsed['children'][2]['data'] ?? '',
             'basicConstraints' => ['ca' => $isCA, 'pathLen' => $pathLen],

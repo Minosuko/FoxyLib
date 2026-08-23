@@ -69,6 +69,15 @@ class FoxyCryptLib {
     public static function createSignedCertificateEC(ECDSA $subjectKey, ECDSA $caKey, array $subject, array $issuer, string $algo = 'sha256', int $days = 365): X509Certificate {
         return X509Certificate::createSignedEC($subjectKey, $caKey, $subject, $issuer, $algo, $days);
     }
+    public static function createCrossSignedCertificate(RSA|ECDSA $subjectKey, RSA|ECDSA $caKey, array $subject, array $issuer, string $algo = 'sha256', int $days = 365, ?int $pathLen = null): X509Certificate {
+        return X509Certificate::createCrossSignedMixed($subjectKey, $caKey, $subject, $issuer, $algo, $days, $pathLen);
+    }
+    public static function crossSignCertificate(X509Certificate $target, RSA|ECDSA $caKey, array $issuer, ?string $algo = null, int $days = 365, ?int $pathLen = null, bool $carryExtensions = true): X509Certificate {
+        return X509Certificate::crossSignCertificate($target, $caKey, $issuer, $algo, $days, $pathLen, $carryExtensions);
+    }
+    public static function verifyCertificateWithIssuer(X509Certificate $cert, RSA|ECDSA $issuerKey): bool {
+        return $cert->verifyWithIssuer($issuerKey);
+    }
 
     // X.509 Extensions
     public static function extension(string $oid, bool $critical, mixed $value): Extension { return new Extension($oid, $critical, $value); }

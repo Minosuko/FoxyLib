@@ -10,12 +10,14 @@ class PESigner {
     private string $certDer;
     private string $hashAlgo;
     private array $extraCerts;
+    private ?array $timestamp;
 
-    public function __construct(object $signerKey, string $certPem, string $hashAlgo = 'sha256', array $extraCerts = []) {
+    public function __construct(object $signerKey, string $certPem, string $hashAlgo = 'sha256', array $extraCerts = [], ?array $timestamp = null) {
         $this->signerKey = $signerKey;
         $this->certDer = PEM::decode($certPem)['data'];
         $this->hashAlgo = $hashAlgo;
         $this->extraCerts = $extraCerts;
+        $this->timestamp = $timestamp;
     }
 
     public static function fromPKCS12(string $pkcs12Path, string $password, string $hashAlgo = 'sha256'): self {
@@ -111,7 +113,23 @@ class PESigner {
         $peHash = hex2bin(Hash::hash($this->hashAlgo, $hashData));
 
         // Pass 2: build PKCS7 with correct hash
-        $pkcs7 = PKCS7::buildAuthenticodeSignature($peHash, $this->signerKey, PEM::encode($this->certDer, 'CERTIFICATE'), $this->hashAlgo, $this->extraCerts);
+        $timestamp = $this->timestamp;
+        if ($timestamp !== null) {
+            $timestamp['attributeOid'] = \FoxySigningTool\TimestampClient::OID_AUTHENTICODE_TIMESTAMP;
+        }
+        $pkcs7 = PKCS7::buildAuthenticodeSignature($peHash, $this->signerKey, PEM::encode($this->certDer, 'CERTIFICATE'), $this->hashAlgo, $this->extraCerts, '', $timestamp);
+
+        // The timestamp token changes the certificate-table size, but that table and
+        // its directory entry are excluded from the Authenticode digest.
+        $totalCertSize = 8 + strlen($pkcs7);
+        $alignedTotalCert = (($totalCertSize + 7) & ~7);
+        if ($alignedTotalCert !== $certSize) {
+            $extended = substr($extended, 0, $certOffset)
+                . str_repeat("\x00", $alignedTotalCert)
+                . substr($extended, $certOffset + $certSize);
+            $extended = substr_replace($extended, pack('VV', $certOffset, $alignedTotalCert), $secDirOff, 8);
+            $certSize = $alignedTotalCert;
+        }
 
         // Embed: replace placeholder zeros with actual signature
         $winCert = pack('V', $totalCertSize) .

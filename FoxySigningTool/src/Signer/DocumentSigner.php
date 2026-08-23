@@ -10,12 +10,14 @@ final class DocumentSigner {
 
     private PDFSigner $pdfSigner;
     private PackageSigner $packageSigner;
+    private ?array $timestamp;
 
     public function __construct(
         object $signerKey,
         string $certPem,
         string $hashAlgo = 'sha256',
-        array $extraCerts = []
+        array $extraCerts = [],
+        ?array $timestamp = null
     ) {
         if (!$signerKey instanceof RSA) {
             throw new \InvalidArgumentException('Document signing requires an RSA private key');
@@ -33,8 +35,9 @@ final class DocumentSigner {
             throw new \InvalidArgumentException('Document signing key does not match the certificate');
         }
 
-        $this->pdfSigner = new PDFSigner($signerKey, $certPem, $hashAlgo, $extraCerts);
+        $this->pdfSigner = new PDFSigner($signerKey, $certPem, $hashAlgo, $extraCerts, $timestamp);
         $this->packageSigner = new PackageSigner($signerKey, $certPem, $hashAlgo, $extraCerts);
+        $this->timestamp = $timestamp;
     }
 
     public static function fromPKCS12(string $pkcs12Path, string $password, string $hashAlgo = 'sha256'): self {
@@ -97,26 +100,32 @@ final class DocumentSigner {
     }
 
     public function signOffice(string $inputPath, ?string $outputPath = null, array $options = []): string {
+        $this->assertPackageTimestampNotRequested();
         return $this->packageSigner->signFile($inputPath, $outputPath, null, $options);
     }
 
     public function signOfficeBinary(string $officeData, array $options = []): string {
+        $this->assertPackageTimestampNotRequested();
         return $this->packageSigner->signBinary($officeData, null, $options);
     }
 
     public function signOOXML(string $inputPath, ?string $outputPath = null, array $options = []): string {
+        $this->assertPackageTimestampNotRequested();
         return $this->packageSigner->signFile($inputPath, $outputPath, 'ooxml', $options);
     }
 
     public function signOOXMLBinary(string $package, array $options = []): string {
+        $this->assertPackageTimestampNotRequested();
         return $this->packageSigner->signBinary($package, 'ooxml', $options);
     }
 
     public function signODF(string $inputPath, ?string $outputPath = null, array $options = []): string {
+        $this->assertPackageTimestampNotRequested();
         return $this->packageSigner->signFile($inputPath, $outputPath, 'odf', $options);
     }
 
     public function signODFBinary(string $package, array $options = []): string {
+        $this->assertPackageTimestampNotRequested();
         return $this->packageSigner->signBinary($package, 'odf', $options);
     }
 
@@ -131,5 +140,11 @@ final class DocumentSigner {
             ),
             default => throw new \RuntimeException("Unsupported document format: .{$extension}"),
         };
+    }
+
+    private function assertPackageTimestampNotRequested(): void {
+        if ($this->timestamp !== null) {
+            throw new \RuntimeException('RFC 3161 timestamps are not supported for OOXML or ODF XML signatures');
+        }
     }
 }

@@ -26,12 +26,14 @@ final class ELFSigner {
     private RSA $signerKey;
     private string $certPem;
     private array $extraCerts;
+    private ?array $timestamp;
 
     public function __construct(
         object $signerKey,
         string $certPem,
         string $hashAlgo = 'sha256',
-        array $extraCerts = []
+        array $extraCerts = [],
+        ?array $timestamp = null
     ) {
         if (!$signerKey instanceof RSA) {
             throw new \InvalidArgumentException('ELF signing requires an RSA private key');
@@ -62,6 +64,7 @@ final class ELFSigner {
         $this->signerKey = $signerKey;
         $this->certPem = $certPem;
         $this->extraCerts = $extraCerts;
+        $this->timestamp = $timestamp;
     }
 
     public static function fromPKCS12(string $pkcs12Path, string $password, string $hashAlgo = 'sha256'): self {
@@ -140,7 +143,8 @@ final class ELFSigner {
             $this->signerKey,
             $this->certPem,
             'sha256',
-            $this->extraCerts
+            $this->extraCerts,
+            $this->timestamp
         );
     }
 
@@ -152,7 +156,8 @@ final class ELFSigner {
             $this->signerKey,
             $this->certPem,
             'sha256',
-            $this->extraCerts
+            $this->extraCerts,
+            $this->timestamp
         );
         return $this->embedSignature($elfData, $elf, $descriptorPrefix . $cms);
     }

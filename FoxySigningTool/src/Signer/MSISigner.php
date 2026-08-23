@@ -24,12 +24,14 @@ final class MSISigner {
     private string $certPem;
     private string $hashAlgo;
     private array $extraCerts;
+    private ?array $timestamp;
 
     public function __construct(
         object $signerKey,
         string $certPem,
         string $hashAlgo = 'sha256',
-        array $extraCerts = []
+        array $extraCerts = [],
+        ?array $timestamp = null
     ) {
         if (!$signerKey instanceof RSA) {
             throw new \InvalidArgumentException('MSI signing requires an RSA private key');
@@ -64,6 +66,7 @@ final class MSISigner {
         $this->certPem = $certPem;
         $this->hashAlgo = $hashAlgo;
         $this->extraCerts = $extraCerts;
+        $this->timestamp = $timestamp;
     }
 
     public static function fromPKCS12(string $pkcs12Path, string $password, string $hashAlgo = 'sha256'): self {
@@ -138,7 +141,8 @@ final class MSISigner {
             $this->certPem,
             $this->hashAlgo,
             $this->extraCerts,
-            2
+            2,
+            $this->authenticodeTimestamp()
         );
         $extendedName = $this->asciiToUtf16Le("\x05MsiDigitalSignatureEx");
         $signatureName = $this->asciiToUtf16Le("\x05DigitalSignature");
@@ -164,8 +168,19 @@ final class MSISigner {
             $this->signerKey,
             $this->certPem,
             $this->hashAlgo,
-            $this->extraCerts
+            $this->extraCerts,
+            1,
+            $this->authenticodeTimestamp()
         );
+    }
+
+    private function authenticodeTimestamp(): ?array {
+        if ($this->timestamp === null) {
+            return null;
+        }
+        return $this->timestamp + [
+            'attributeOid' => \FoxySigningTool\TimestampClient::OID_AUTHENTICODE_TIMESTAMP,
+        ];
     }
 
     private function parseCompoundFile(string $data): array {

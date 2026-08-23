@@ -10,6 +10,7 @@ class MacOSSigner {
     private string $certDer;
     private string $hashAlgo;
     private array $extraCerts;
+    private ?array $timestamp;
 
     const CSMAGIC_REQUIREMENT = 0xfade0c00;
     const CSMAGIC_REQUIREMENTS = 0xfade0c01;
@@ -24,11 +25,12 @@ class MacOSSigner {
     const CSSLOT_ENTITLEMENTS = 0x00005;
     const CSSLOT_SIGNATURE = 0x10000;
 
-    public function __construct(object $signerKey, string $certPem, string $hashAlgo = 'sha256', array $extraCerts = []) {
+    public function __construct(object $signerKey, string $certPem, string $hashAlgo = 'sha256', array $extraCerts = [], ?array $timestamp = null) {
         $this->signerKey = $signerKey;
         $this->certDer = PEM::decode($certPem)['data'];
         $this->hashAlgo = $hashAlgo;
         $this->extraCerts = $extraCerts;
+        $this->timestamp = $timestamp;
     }
 
     public static function fromPKCS12(string $pkcs12Path, string $password, string $hashAlgo = 'sha256'): self {
@@ -56,12 +58,12 @@ class MacOSSigner {
 
     public function signDetached(string $data): string {
         $hash = hex2bin(Hash::hash($this->hashAlgo, $data));
-        return PKCS7::buildDetachedSignature($hash, $this->signerKey, PEM::encode($this->certDer, 'CERTIFICATE'), $this->hashAlgo, $this->extraCerts);
+        return PKCS7::buildDetachedSignature($hash, $this->signerKey, PEM::encode($this->certDer, 'CERTIFICATE'), $this->hashAlgo, $this->extraCerts, $this->timestamp);
     }
 
     public function buildEmbeddedSignature(string $machoData): string {
         $hash = hex2bin(Hash::hash($this->hashAlgo, $machoData));
-        $pkcs7 = PKCS7::buildDetachedSignature($hash, $this->signerKey, PEM::encode($this->certDer, 'CERTIFICATE'), $this->hashAlgo, $this->extraCerts);
+        $pkcs7 = PKCS7::buildDetachedSignature($hash, $this->signerKey, PEM::encode($this->certDer, 'CERTIFICATE'), $this->hashAlgo, $this->extraCerts, $this->timestamp);
 
         $codeDir = $this->buildCodeDirectory($machoData);
         $reqBlob = $this->buildRequirementsBlob();

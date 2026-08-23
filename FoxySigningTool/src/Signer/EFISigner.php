@@ -9,12 +9,14 @@ class EFISigner {
     private string $certDer;
     private string $hashAlgo;
     private array $extraCerts;
+    private ?array $timestamp;
 
-    public function __construct(object $signerKey, string $certPem, string $hashAlgo = 'sha256', array $extraCerts = []) {
+    public function __construct(object $signerKey, string $certPem, string $hashAlgo = 'sha256', array $extraCerts = [], ?array $timestamp = null) {
         $this->signerKey = $signerKey;
         $this->certDer = PEM::decode($certPem)['data'];
         $this->hashAlgo = $hashAlgo;
         $this->extraCerts = $extraCerts;
+        $this->timestamp = $timestamp;
     }
 
     public static function fromPKCS12(string $pkcs12Path, string $password, string $hashAlgo = 'sha256'): self {
@@ -43,7 +45,8 @@ class EFISigner {
             $this->signerKey,
             PEM::encode($this->certDer, 'CERTIFICATE'),
             $this->hashAlgo,
-            $this->extraCerts
+            $this->extraCerts,
+            $this->timestamp
         );
     }
 

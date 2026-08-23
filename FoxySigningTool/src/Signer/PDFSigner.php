@@ -11,11 +11,12 @@ final class PDFSigner {
     private RSA $signerKey;
     private string $certPem;
     private array $extraCerts;
+    private ?array $timestamp;
     private array $xrefEntries = [];
     private array $objectCache = [];
     private array $objectStreamCache = [];
 
-    public function __construct(object $signerKey, string $certPem, string $hashAlgo = 'sha256', array $extraCerts = []) {
+    public function __construct(object $signerKey, string $certPem, string $hashAlgo = 'sha256', array $extraCerts = [], ?array $timestamp = null) {
         if (!$signerKey instanceof RSA) {
             throw new \InvalidArgumentException('PDF signing requires an RSA private key');
         }
@@ -46,6 +47,7 @@ final class PDFSigner {
         $this->signerKey = $signerKey;
         $this->certPem = $certPem;
         $this->extraCerts = $extraCerts;
+        $this->timestamp = $timestamp;
     }
 
     public function signFile(string $inputPath, ?string $outputPath = null, array $options = []): string {
@@ -147,7 +149,8 @@ final class PDFSigner {
                 $this->signerKey,
                 $this->certPem,
                 'sha256',
-                $this->extraCerts
+                $this->extraCerts,
+                $this->timestamp
             );
 
             if (strlen($cms) <= $reserve) {

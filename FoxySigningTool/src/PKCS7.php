@@ -48,7 +48,8 @@ class PKCS7 {
         ?string $contentDer = null,
         ?array $extraAttrs = [],
         bool $includeSignedAttrs = true,
-        bool $rawContent = false
+        bool $rawContent = false,
+        ?array $timestamp = null
     ): string {
         $hashOid = self::hashAlgoToOid($hashAlgo);
         $sigAlgoOid = self::getSignatureAlgoOid($signerKey, $hashAlgo);
@@ -95,7 +96,7 @@ class PKCS7 {
                 $issuerAndSerial,
                 DER::encodeSequence([DER::encodeOID($hashOid), DER::encodeNull()]),
                 $signedAttrs,
-                DER::encodeSequence([DER::encodeOID(self::OID_RSA), DER::encodeNull()]),
+                DER::encodeSequence([DER::encodeOID($sigAlgoOid), DER::encodeNull()]),
                 DER::encodeOctetString($sigValue)
             ]);
         } else {
@@ -103,7 +104,7 @@ class PKCS7 {
                 DER::encodeInteger("\x01"),
                 $issuerAndSerial,
                 DER::encodeSequence([DER::encodeOID($hashOid), DER::encodeNull()]),
-                DER::encodeSequence([DER::encodeOID(self::OID_RSA), DER::encodeNull()]),
+                DER::encodeSequence([DER::encodeOID($sigAlgoOid), DER::encodeNull()]),
                 DER::encodeOctetString($sigValue)
             ]);
         }
@@ -140,10 +141,11 @@ class PKCS7 {
             DER::encodeSet([$signerInfo])
         ]);
 
-        return DER::encodeSequence([
+        $cms = DER::encodeSequence([
             DER::encodeOID(self::OID_SIGNED_DATA),
             DER::encodeContextSpecific(0, $signedData, true)
         ]);
+        return self::applyTimestamp($cms, $hashAlgo, $timestamp);
     }
 
     public static function buildDetachedSignature(
@@ -151,9 +153,10 @@ class PKCS7 {
         object $signerKey,
         string $certPem,
         string $hashAlgo = 'sha256',
-        array $extraCerts = []
+        array $extraCerts = [],
+        ?array $timestamp = null
     ): string {
-        return self::buildSignedData($content, self::OID_DATA, $signerKey, $certPem, $hashAlgo, $extraCerts);
+        return self::buildSignedData($content, self::OID_DATA, $signerKey, $certPem, $hashAlgo, $extraCerts, null, [], true, false, $timestamp);
     }
 
     public static function buildAuthenticodeSignature(
@@ -162,7 +165,8 @@ class PKCS7 {
         string $certPem,
         string $hashAlgo = 'sha256',
         array $extraCerts = [],
-        string $fileUrl = ''
+        string $fileUrl = '',
+        ?array $timestamp = null
     ): string {
         $hashOid = self::hashAlgoToOid($hashAlgo);
 
@@ -206,7 +210,8 @@ class PKCS7 {
             $spcIndirectData,
             $attrList,
             true,
-            true
+            true,
+            $timestamp
         );
     }
 
@@ -216,7 +221,8 @@ class PKCS7 {
         string $certPem,
         string $hashAlgo = 'sha256',
         array $extraCerts = [],
-        int $sipVersion = 1
+        int $sipVersion = 1,
+        ?array $timestamp = null
     ): string {
         if ($sipVersion !== 1 && $sipVersion !== 2) {
             throw new \InvalidArgumentException('MSI SIP version must be 1 or 2');
@@ -258,8 +264,32 @@ class PKCS7 {
             $spcIndirectData,
             [$statementType],
             true,
-            true
+            true,
+            $timestamp
         );
+    }
+
+    private static function applyTimestamp(string $cms, string $hashAlgo, ?array $timestamp): string {
+        if ($timestamp === null) {
+            return $cms;
+        }
+        $url = $timestamp['url'] ?? null;
+        if (!is_string($url) || $url === '') {
+            throw new \InvalidArgumentException('Timestamp URL must be a non-empty string');
+        }
+        $timeout = $timestamp['timeout'] ?? 15;
+        if (!is_int($timeout)) {
+            throw new \InvalidArgumentException('Timestamp timeout must be an integer');
+        }
+        $timestampHash = $timestamp['hash'] ?? $hashAlgo;
+        if (!is_string($timestampHash)) {
+            throw new \InvalidArgumentException('Timestamp hash must be a string');
+        }
+        $attributeOid = $timestamp['attributeOid'] ?? TimestampClient::OID_SIGNATURE_TIMESTAMP;
+        if (!is_string($attributeOid)) {
+            throw new \InvalidArgumentException('Timestamp attribute OID must be a string');
+        }
+        return (new TimestampClient($url, $timeout))->timestamp($cms, $timestampHash, $attributeOid);
     }
 
     private static function signDigest(string $digest, object $key, string $hashAlgo): string {

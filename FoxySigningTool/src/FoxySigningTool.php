@@ -3,7 +3,7 @@ declare(strict_types=1);
 namespace FoxySigningTool;
 
 use FoxyCryptLib\{FoxyCryptLib, RSA, ECDSA, DSA, DER, PEM, Certificate\PKCS12};
-use FoxySigningTool\Signer\{PESigner, ELFSigner, MacOSSigner, EFISigner, MSISigner, DocumentSigner};
+use FoxySigningTool\Signer\{PESigner, ELFSigner, MacOSSigner, EFISigner, MSISigner, DocumentSigner, APKSigner};
 
 class FoxySigningTool {
     // ---- Certificate Loading ----
@@ -12,7 +12,11 @@ class FoxySigningTool {
     }
 
     public static function loadPKCS12(string $path, string $password): array {
-        return FoxyCryptLib::pkcs12Decode(file_get_contents($path), $password);
+        $contents = @file_get_contents($path);
+        if ($contents === false) {
+            throw new \RuntimeException("Unable to read PFX/PKCS12 file: {$path}");
+        }
+        return FoxyCryptLib::pkcs12Decode($contents, $password);
     }
 
     public static function extractCertFromPKCS12(array $pkcs12): array {
@@ -28,17 +32,44 @@ class FoxySigningTool {
         return PESigner::keyInfoToKey($keyInfo);
     }
 
+    public static function extractIdentityFromPKCS12(array $pkcs12): array {
+        $key = self::extractKeyFromPKCS12($pkcs12);
+        $signerCertificate = null;
+        $extraCerts = [];
+        foreach ($pkcs12['certificates'] ?? [] as $certificateDer) {
+            $certificatePem = PEM::encode($certificateDer, 'CERTIFICATE');
+            if ($signerCertificate === null && self::keyMatchesCertificate($key, $certificatePem)) {
+                $signerCertificate = $certificatePem;
+            } else {
+                $extraCerts[] = $certificatePem;
+            }
+        }
+        if ($signerCertificate === null) {
+            throw new \RuntimeException('No certificate in PFX/PKCS12 matches the private key');
+        }
+        return ['key' => $key, 'certificate' => $signerCertificate, 'extraCerts' => $extraCerts];
+    }
+
     // ---- File type detection ----
     public static function detectFileType(string $path): string {
-        $fh = fopen($path, 'rb');
+        $fh = @fopen($path, 'rb');
+        if ($fh === false) {
+            throw new \RuntimeException("Unable to read input file: {$path}");
+        }
         $magic = fread($fh, 64);
         fclose($fh);
+        if ($magic === false) {
+            throw new \RuntimeException("Unable to read input file: {$path}");
+        }
 
         if (substr($magic, 0, 2) === "MZ") {
             $peOffset = unpack('V', substr($magic, 0x3C, 4))[1] ?? 0;
-            if ($peOffset > 0 && $peOffset < filesize($path)) {
-                fclose(fopen($path, 'rb'));
-                $fh = fopen($path, 'rb');
+            $fileSize = @filesize($path);
+            if ($fileSize !== false && $peOffset > 0 && $peOffset < $fileSize) {
+                $fh = @fopen($path, 'rb');
+                if ($fh === false) {
+                    throw new \RuntimeException("Unable to read input file: {$path}");
+                }
                 fseek($fh, $peOffset);
                 $peSig = fread($fh, 4);
                 fclose($fh);
@@ -74,6 +105,7 @@ class FoxySigningTool {
 
         $ext = strtolower(pathinfo($path, PATHINFO_EXTENSION));
         return match ($ext) {
+            'apk' => 'apk',
             'exe', 'dll', 'ocx', 'sys', 'cpl', 'scr' => 'pe',
             'efi', 'rom', 'bin' => 'efi',
             'dmg', 'dylib', 'app', 'kext', 'bundle' => 'macho',
@@ -91,25 +123,29 @@ class FoxySigningTool {
         $hashAlgo = $options['hash'] ?? 'sha256';
         $outputPath = $options['output'] ?? $inputPath;
         $extraCerts = $options['extraCerts'] ?? [];
+        $timestamp = self::timestampOptions($options);
 
         return match ($type) {
-            'pe' => (new PESigner($signerKey, $certPem, $hashAlgo, $extraCerts))->signFile($inputPath, $outputPath),
-            'efi' => (new EFISigner($signerKey, $certPem, $hashAlgo, $extraCerts))->signFile($inputPath, $outputPath),
-            'elf' => (new ELFSigner($signerKey, $certPem, $hashAlgo, $extraCerts))->signFile($inputPath, $outputPath, $options['embedded'] ?? true),
-            'macho' => (new MacOSSigner($signerKey, $certPem, $hashAlgo, $extraCerts))->signFile($inputPath, $outputPath),
-            'msi' => (new MSISigner($signerKey, $certPem, $hashAlgo, $extraCerts))->signFile($inputPath, $outputPath),
-            'document' => (new DocumentSigner($signerKey, $certPem, $hashAlgo, $extraCerts))->signDocument($inputPath, $outputPath, $options),
+            'apk' => (new APKSigner($signerKey, $certPem, $hashAlgo, $extraCerts))->signFile($inputPath, $outputPath, $options),
+            'pe' => (new PESigner($signerKey, $certPem, $hashAlgo, $extraCerts, $timestamp))->signFile($inputPath, $outputPath),
+            'efi' => (new EFISigner($signerKey, $certPem, $hashAlgo, $extraCerts, $timestamp))->signFile($inputPath, $outputPath),
+            'elf' => (new ELFSigner($signerKey, $certPem, $hashAlgo, $extraCerts, $timestamp))->signFile($inputPath, $outputPath, $options['embedded'] ?? true),
+            'macho' => (new MacOSSigner($signerKey, $certPem, $hashAlgo, $extraCerts, $timestamp))->signFile($inputPath, $outputPath),
+            'msi' => (new MSISigner($signerKey, $certPem, $hashAlgo, $extraCerts, $timestamp))->signFile($inputPath, $outputPath),
+            'document' => (new DocumentSigner($signerKey, $certPem, $hashAlgo, $extraCerts, $timestamp))->signDocument($inputPath, $outputPath, $options),
             default => throw new \RuntimeException("Unsupported file type: {$type}"),
         };
     }
 
     public static function signWithPKCS12(string $inputPath, string $pkcs12Path, string $password, array $options = []): string {
         $pkcs12 = self::loadPKCS12($pkcs12Path, $password);
-        $key = self::extractKeyFromPKCS12($pkcs12);
-        $certPems = self::extractCertFromPKCS12($pkcs12);
-        $certPem = $certPems[0];
-        $options['extraCerts'] = array_slice($certPems, 1);
-        return self::sign($inputPath, $key, $certPem, $options);
+        $identity = self::extractIdentityFromPKCS12($pkcs12);
+        $options['extraCerts'] = array_merge($identity['extraCerts'], $options['extraCerts'] ?? []);
+        return self::sign($inputPath, $identity['key'], $identity['certificate'], $options);
+    }
+
+    public static function signWithPFX(string $inputPath, string $pfxPath, string $password, array $options = []): string {
+        return self::signWithPKCS12($inputPath, $pfxPath, $password, $options);
     }
 
     public static function signWithPEM(string $inputPath, string $keyPem, string $certPem, array $options = []): string {
@@ -118,12 +154,44 @@ class FoxySigningTool {
     }
 
     // ---- Detached signature generation ----
-    public static function signDetached(string $data, object $signerKey, string $certPem, string $hashAlgo = 'sha256', array $extraCerts = []): string {
-        return PKCS7::buildDetachedSignature($data, $signerKey, $certPem, $hashAlgo, $extraCerts);
+    public static function signDetached(string $data, object $signerKey, string $certPem, string $hashAlgo = 'sha256', array $extraCerts = [], array $options = []): string {
+        return PKCS7::buildDetachedSignature($data, $signerKey, $certPem, $hashAlgo, $extraCerts, self::timestampOptions($options));
+    }
+
+    private static function timestampOptions(array $options): ?array {
+        if (!array_key_exists('timestampUrl', $options)) {
+            return null;
+        }
+        return [
+            'url' => $options['timestampUrl'],
+            'hash' => $options['timestampHash'] ?? ($options['hash'] ?? 'sha256'),
+            'timeout' => $options['timestampTimeout'] ?? 15,
+        ];
+    }
+
+    private static function keyMatchesCertificate(object $key, string $certificatePem): bool {
+        try {
+            $certificate = \FoxyCryptLib\X509Certificate::fromPEM($certificatePem);
+            $publicPem = PEM::encode($certificate['subjectPublicKeyInfo']['raw'], 'PUBLIC KEY');
+            if ($key instanceof RSA) {
+                $candidate = RSA::fromPEM($publicPem)->getPublicKey();
+                $public = $key->getPublicKey();
+                return $public['n']->equals($candidate['n']) && $public['e']->equals($candidate['e']);
+            }
+            if ($key instanceof ECDSA) {
+                $candidate = ECDSA::fromPEM($publicPem)->getPublicKey();
+                $public = $key->getPublicKey();
+                return $public['x']->equals($candidate['x']) && $public['y']->equals($candidate['y']);
+            }
+        } catch (\Throwable) {
+            return false;
+        }
+        return false;
     }
 
     public static function getSupportedTypes(): array {
         return [
+            'apk' => ['apk'],
             'pe' => ['exe', 'dll', 'ocx', 'sys', 'cpl', 'scr'],
             'efi' => ['efi', 'rom'],
             'elf' => ['so', 'o', 'ko', 'a', 'linux binary'],
